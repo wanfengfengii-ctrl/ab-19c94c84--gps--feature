@@ -1,8 +1,10 @@
-"""Cross-leap-second HTTP smoke test, executed inside the API container.
+"""HTTP smoke test, executed inside the API container.
 
-Talks real HTTP over the loopback interface and exits non-zero on the
-first discrepancy.  Every assertion is about serialized (decimal string)
-values exactly as a deep-space ground-system client would see them.
+Covers the 2016-12-31 leap second and the 10-bit GPS week (mod-1024)
+era resolution.  Talks real HTTP over the loopback interface and exits
+non-zero on the first discrepancy.  Every assertion is about serialized
+(decimal string) values exactly as a deep-space ground-system client
+would see them.
 """
 
 from __future__ import annotations
@@ -181,6 +183,103 @@ def main() -> int:
     check(status == 400 and "floating-point"
           in body["error"].get("message", ""),
           "floating-point JSON number rejected")
+
+    print("[smoke] 10-bit GPS week resolution across 1024-week eras")
+    status, body = post({
+        "events": [
+            # Same 10-bit week 906, two different 1024-week eras pinned
+            # down by the acquisition-time hint referenceUtc.
+            {"id": "era-1997", "gpsWeekModulo": 906,
+             "gpsSecondsInWeek": 0,
+             "referenceUtc": "1997-05-25T12:00:00Z"},
+            {"id": "era-2017", "gpsWeekModulo": 906,
+             "gpsSecondsInWeek": 0,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+            # Full-week twins of the same physical instants:
+            {"id": "full-906", "gpsWeek": 906, "gpsSecondsInWeek": 0},
+            {"id": "full-1930", "gpsWeek": 1930, "gpsSecondsInWeek": 0},
+            # Modulo event landing inside the 2016 leap second:
+            {"id": "leap-mod", "gpsWeekModulo": 906,
+             "gpsSecondsInWeek": 17, "gpsNanoseconds": 500_000_000,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+        ]
+    })
+    check(status == 200, f"modulo batch status 200 (got {status})")
+    if status == 200:
+        results = body["results"]
+        check([r["id"] for r in results] == [
+            "era-1997", "era-2017", "full-906", "full-1930", "leap-mod",
+        ], "modulo result order matches input order")
+        e1, e2 = by_id(results, "era-1997"), by_id(results, "era-2017")
+        f1, f2 = by_id(results, "full-906"), by_id(results, "full-1930")
+        leap_m = by_id(results, "leap-mod")
+        check(
+            e1.get("resolvedGpsWeek") == "906"
+            and e2.get("resolvedGpsWeek") == "1930",
+            "same modulo week resolves to 906 and 1930 in the two eras",
+        )
+        check(
+            e1["taiNanoseconds"] == f1["taiNanoseconds"]
+            == "863913619000000000"
+            and e1["utc"] == f1["utc"] == "1997-05-17T23:59:49Z",
+            "era-1997 modulo event matches full week 906 exactly",
+        )
+        check(
+            e2["taiNanoseconds"] == f2["taiNanoseconds"]
+            == "1483228819000000000"
+            and e2["utc"] == f2["utc"] == "2016-12-31T23:59:43Z",
+            "era-2017 modulo event matches full week 1930 exactly",
+        )
+        check(
+            leap_m.get("resolvedGpsWeek") == "1930"
+            and leap_m["utc"] == "2016-12-31T23:59:60.5Z"
+            and leap_m["utcTaiOffsetSeconds"] == "-36",
+            "modulo event resolves into the leap second (23:59:60.5)",
+        )
+        check(
+            "resolvedGpsWeek" not in f1 and "resolvedGpsWeek" not in f2,
+            "full-week events do not echo resolvedGpsWeek",
+        )
+
+    print("[smoke] unresolvable modulo weeks fail wholesale")
+    status, body = post({"events": [
+        {"id": "midpoint", "gpsWeekModulo": 906, "gpsSecondsInWeek": 0,
+         "referenceUtc": "2007-03-10T23:59:46Z"},
+    ]})
+    err = body.get("error", {})
+    check(status == 400 and err.get("eventId") == "midpoint"
+          and err.get("eventIndex") == 0
+          and "exactly 512 weeks" in err.get("message", "")
+          and "results" not in body,
+          "reference exactly 512 weeks away -> 400 ambiguity error")
+
+    status, body = post({"events": [
+        {"id": "no-cand", "gpsWeekModulo": 1000, "gpsSecondsInWeek": 0,
+         "referenceUtc": "2017-01-01T00:00:00Z"},
+    ]})
+    err = body.get("error", {})
+    check(status == 400 and err.get("eventId") == "no-cand"
+          and "no GPS week congruent to 1000" in err.get("message", "")
+          and "results" not in body,
+          "no in-era candidate within 512 weeks -> 400")
+
+    status, body = post({"events": [
+        {"id": "mix", "gpsWeek": 1930, "gpsWeekModulo": 906,
+         "gpsSecondsInWeek": 0, "referenceUtc": "2017-01-01T00:00:00Z"},
+    ]})
+    err = body.get("error", {})
+    check(status == 400 and err.get("eventId") == "mix"
+          and "gpsWeekModulo" in err.get("message", ""),
+          "gpsWeek mixed with gpsWeekModulo -> 400")
+
+    status, body = post({"events": [
+        {"id": "ref-out", "gpsWeekModulo": 1, "gpsSecondsInWeek": 0,
+         "referenceUtc": "2020-01-01T00:00:00Z"},
+    ]})
+    err = body.get("error", {})
+    check(status == 400 and err.get("eventId") == "ref-out"
+          and "2017-06-28" in err.get("message", ""),
+          "referenceUtc beyond supported era -> 400 naming table expiry")
 
     if failures:
         print(f"[smoke] {len(failures)} FAILURE(S)")

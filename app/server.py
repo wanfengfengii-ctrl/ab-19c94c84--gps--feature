@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .timecore import (
     TimeConversionError,
     normalize_gps_event,
+    normalize_gps_modulo_event,
     normalize_utc_event,
 )
 
@@ -23,7 +24,7 @@ MAX_EVENTS = 200
 MIN_EVENTS = 1
 
 GPS_FIELDS = ("gpsWeek", "gpsSecondsInWeek", "gpsNanoseconds")
-ALLOWED_FIELDS = {"id", "utc", *GPS_FIELDS}
+ALLOWED_FIELDS = {"id", "utc", *GPS_FIELDS, "gpsWeekModulo", "referenceUtc"}
 
 
 class RequestError(Exception):
@@ -134,20 +135,33 @@ def _normalize_one(item: object, index: int) -> dict[str, str]:
         fail(f"unknown field(s): {', '.join(sorted(unknown))}")
 
     has_utc = "utc" in item
-    gps_present = [f for f in GPS_FIELDS if f in item]
-    has_gps = bool(gps_present)
-    if has_utc and has_gps:
-        fail("event specifies both 'utc' and GPS fields; choose exactly one")
-    if not has_utc and not has_gps:
-        fail("event must contain either 'utc' or GPS fields"
-             " (gpsWeek, gpsSecondsInWeek[, gpsNanoseconds])")
+    has_week = "gpsWeek" in item
+    has_modulo = "gpsWeekModulo" in item
+    has_reference = "referenceUtc" in item
+    has_gps_aux = any(
+        f in item for f in ("gpsSecondsInWeek", "gpsNanoseconds")
+    )
 
+    # The three input kinds (UTC, full GPS week, modulo GPS week) must
+    # never mix fields with one another.
+    if has_utc and (has_week or has_modulo or has_reference or has_gps_aux):
+        fail("event specifies both 'utc' and GPS fields; choose exactly one")
+    if has_week and has_modulo:
+        fail("event specifies both 'gpsWeek' and 'gpsWeekModulo';"
+             " choose exactly one")
+    if has_reference and not has_modulo:
+        fail("'referenceUtc' is only valid in a gpsWeekModulo event")
+    if not has_utc and not has_week and not has_modulo:
+        fail("event must contain 'utc', GPS fields (gpsWeek,"
+             " gpsSecondsInWeek[, gpsNanoseconds]) or modulo GPS fields"
+             " (gpsWeekModulo, gpsSecondsInWeek[, gpsNanoseconds],"
+             " referenceUtc)")
+
+    resolved_week: int | None = None
     try:
         if has_utc:
             result = normalize_utc_event(item["utc"])
-        else:
-            if "gpsWeek" not in item:
-                fail("GPS event is missing 'gpsWeek'")
+        elif has_week:
             if "gpsSecondsInWeek" not in item:
                 fail("GPS event is missing 'gpsSecondsInWeek'")
             week = _gps_int(item["gpsWeek"], "gpsWeek")
@@ -156,12 +170,27 @@ def _normalize_one(item: object, index: int) -> dict[str, str]:
             if "gpsNanoseconds" in item:
                 nanos = _gps_int(item["gpsNanoseconds"], "gpsNanoseconds")
             result = normalize_gps_event(week, sow, nanos)
+        else:
+            if "gpsSecondsInWeek" not in item:
+                fail("modulo GPS event is missing 'gpsSecondsInWeek'")
+            if "referenceUtc" not in item:
+                fail("modulo GPS event is missing 'referenceUtc'")
+            wmod = _gps_int(item["gpsWeekModulo"], "gpsWeekModulo")
+            sow = _gps_int(item["gpsSecondsInWeek"], "gpsSecondsInWeek")
+            nanos = 0
+            if "gpsNanoseconds" in item:
+                nanos = _gps_int(item["gpsNanoseconds"], "gpsNanoseconds")
+            result, resolved_week = normalize_gps_modulo_event(
+                wmod, sow, nanos, item["referenceUtc"]
+            )
     except TimeConversionError as exc:
         fail(str(exc))
     except RequestError as exc:
         fail(str(exc))
 
     body = result.to_response()
+    if resolved_week is not None:
+        body["resolvedGpsWeek"] = str(resolved_week)
     body["id"] = str(event_id)
     return body  # type: ignore[return-value]
 

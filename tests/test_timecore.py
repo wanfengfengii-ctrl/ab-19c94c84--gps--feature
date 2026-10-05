@@ -21,6 +21,7 @@ from app.timecore import (
     NormalizedEvent,
     TimeConversionError,
     normalize_gps_event,
+    normalize_gps_modulo_event,
     normalize_utc_event,
     tai_to_utc,
     utc_to_tai,
@@ -143,6 +144,145 @@ class CrossInputEquivalenceTests(unittest.TestCase):
                 via_gps.utc_minus_tai, via_utc.utc_minus_tai
             )
             self.assertEqual(via_gps.to_response(), via_utc.to_response())
+            checked += 1
+
+
+class ModuloWeekResolutionTests(unittest.TestCase):
+    """10-bit GPS week (mod 1024) resolution against a reference instant.
+
+    Independent reference instants: GPS week 906 SOW 0 is
+    1997-05-17T23:59:49Z (TAI 863913619000000000); the congruent week
+    1930 SOW 0 is 2016-12-31T23:59:43Z (TAI 1483228819000000000), exactly
+    1024 weeks later.
+    """
+
+    def test_same_modulo_two_eras(self) -> None:
+        ev1, w1 = normalize_gps_modulo_event(
+            906, 0, 0, "1997-05-25T12:00:00Z"
+        )
+        self.assertEqual(w1, 906)
+        self.assertEqual(ev1, normalize_gps_event(906, 0, 0))
+        self.assertEqual(ev1.utc_canonical, "1997-05-17T23:59:49Z")
+        self.assertEqual(ev1.tai_ns, 863_913_619_000_000_000)
+
+        ev2, w2 = normalize_gps_modulo_event(
+            906, 0, 0, "2017-01-01T00:00:00Z"
+        )
+        self.assertEqual(w2, 1930)
+        self.assertEqual(ev2, normalize_gps_event(1930, 0, 0))
+        self.assertEqual(ev2.utc_canonical, "2016-12-31T23:59:43Z")
+        self.assertEqual(ev2.tai_ns, 1_483_228_819_000_000_000)
+
+    def test_resolution_across_leap_second_with_nanos(self) -> None:
+        # The leap second 2016-12-31T23:59:60.5 is GPS week 1930 SOW 17.5;
+        # its 10-bit week is 906.
+        ev, w = normalize_gps_modulo_event(
+            906, 17, 500_000_000, "2017-01-01T00:00:00Z"
+        )
+        self.assertEqual(w, 1930)
+        self.assertEqual(ev.utc_canonical, "2016-12-31T23:59:60.5Z")
+        self.assertEqual(ev.utc_minus_tai, -36)
+        self.assertEqual(
+            ev, normalize_gps_event(1930, 17, 500_000_000)
+        )
+
+    def test_reference_may_predate_gps_epoch(self) -> None:
+        # The table era starts 1972; a 1979 reference still pins week 0.
+        ev, w = normalize_gps_modulo_event(0, 0, 0, "1979-12-31T00:00:00Z")
+        self.assertEqual(w, 0)
+        self.assertEqual(ev.utc_canonical, "1980-01-06T00:00:00Z")
+
+    def test_exactly_512_weeks_is_ambiguous(self) -> None:
+        # Reference exactly at the rollover midpoint: weeks 906 and 1930
+        # are both exactly 512 weeks away.
+        with self.assertRaises(TimeConversionError) as cm:
+            normalize_gps_modulo_event(906, 0, 0, "2007-03-10T23:59:46Z")
+        self.assertIn("exactly 512 weeks", str(cm.exception))
+        self.assertIn("906", str(cm.exception))
+        self.assertIn("1930", str(cm.exception))
+
+    def test_exactly_512_weeks_single_in_era_candidate(self) -> None:
+        # Week 2024 (= 1000 + 1024) is beyond the table expiry, yet the
+        # lone in-era candidate 1000 still sits exactly at the midpoint.
+        with self.assertRaises(TimeConversionError) as cm:
+            normalize_gps_modulo_event(1000, 0, 0, "2008-12-27T23:59:46Z")
+        self.assertIn("exactly 512 weeks", str(cm.exception))
+
+    def test_no_candidate_within_era(self) -> None:
+        # Week 1000 (1999-03) is ~930 weeks from the 2017 reference and
+        # week 2024 is outside the supported era: nothing qualifies.
+        with self.assertRaises(TimeConversionError) as cm:
+            normalize_gps_modulo_event(1000, 0, 0, "2017-01-01T00:00:00Z")
+        msg = str(cm.exception)
+        self.assertIn("no GPS week congruent to 1000", msg)
+        self.assertIn("2024", msg)
+        self.assertIn("2017-06-28", msg)
+
+    def test_modulo_range(self) -> None:
+        for bad in (-1, 1024, 2048):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TimeConversionError):
+                    normalize_gps_modulo_event(
+                        bad, 0, 0, "2017-01-01T00:00:00Z"
+                    )
+        for wm in (0, 1023):
+            _, w = normalize_gps_modulo_event(
+                wm, 0, 0, "1997-05-25T12:00:00Z"
+            )
+            self.assertEqual(w % 1024, wm)
+
+    def test_modulo_field_types_and_ranges(self) -> None:
+        for args in (
+            ("906", 0, 0),      # string week modulo
+            (906, "0", 0),      # string SOW
+            (906, 0, "0"),      # string nanos
+            (True, 0, 0),       # bool is not an int
+            (906, 604_800, 0),  # SOW out of range
+            (906, -1, 0),
+            (906, 0, 1_000_000_000),
+            (906, 0, -1),
+        ):
+            with self.subTest(args=args):
+                with self.assertRaises(TimeConversionError):
+                    normalize_gps_modulo_event(
+                        args[0], args[1], args[2], "2017-01-01T00:00:00Z"
+                    )
+
+    def test_reference_utc_validated_like_utc_event(self) -> None:
+        for ref in (
+            "2018-01-01T00:00:00Z",      # beyond table expiry
+            "1971-12-31T23:59:59Z",      # before the table era
+            "2016-12-30T23:59:60Z",      # fake leap position
+            "not-a-time",
+            42,
+        ):
+            with self.subTest(ref=ref):
+                with self.assertRaises(TimeConversionError):
+                    normalize_gps_modulo_event(906, 0, 0, ref)
+
+    def test_random_resolution_matches_full_week(self) -> None:
+        rng = random.Random(20261005)
+        week_ns = SECONDS_PER_WEEK * NS_PER_SECOND
+        checked = 0
+        while checked < 500:
+            tai = rng.randrange(GPS_EPOCH_TAI_NS, TABLE_EXPIRY_TAI_NS)
+            raw = tai - GPS_EPOCH_TAI_NS
+            w_full, rem = divmod(raw, week_ns)
+            sow, ns = divmod(rem, NS_PER_SECOND)
+            delta = rng.randrange(0, 512 * week_ns)
+            if rng.randrange(2):
+                delta = -delta
+            ref_tai = tai + delta
+            if not (MIN_SUPPORTED_TAI_NS <= ref_tai < TABLE_EXPIRY_TAI_NS):
+                ref_tai = tai - delta
+            if not (MIN_SUPPORTED_TAI_NS <= ref_tai < TABLE_EXPIRY_TAI_NS):
+                continue
+            ref_text = _format_utc(*tai_to_utc(ref_tai)[:7])
+            ev, w = normalize_gps_modulo_event(
+                w_full % 1024, sow, ns, ref_text
+            )
+            self.assertEqual(w, w_full)
+            self.assertEqual(ev, normalize_gps_event(w_full, sow, ns))
             checked += 1
 
 

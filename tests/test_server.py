@@ -204,5 +204,140 @@ class BatchErrorTests(unittest.TestCase):
         self.assertEqual(exc.event_id, "1")
 
 
+class BatchModuloWeekTests(unittest.TestCase):
+    def test_cross_era_batch_order_and_resolved_week(self) -> None:
+        payload = {
+            "events": [
+                {"id": "era-1997", "gpsWeekModulo": 906,
+                 "gpsSecondsInWeek": 0,
+                 "referenceUtc": "1997-05-25T12:00:00Z"},
+                {"id": "utc-twin", "utc": "1997-05-17T23:59:49Z"},
+                {"id": "era-2017", "gpsWeekModulo": 906,
+                 "gpsSecondsInWeek": 0,
+                 "referenceUtc": "2017-01-01T00:00:00Z"},
+                {"id": "full-twin", "gpsWeek": 1930, "gpsSecondsInWeek": 0},
+            ]
+        }
+        out = normalize_batch(enc(payload))
+        self.assertEqual(
+            [r["id"] for r in out],
+            ["era-1997", "utc-twin", "era-2017", "full-twin"],
+        )
+        # Only modulo events echo the resolved full week.
+        self.assertEqual(out[0]["resolvedGpsWeek"], "906")
+        self.assertEqual(out[2]["resolvedGpsWeek"], "1930")
+        self.assertNotIn("resolvedGpsWeek", out[1])
+        self.assertNotIn("resolvedGpsWeek", out[3])
+        # Resolved instants are identical to their full-week/UTC twins.
+        self.assertEqual(out[0]["taiNanoseconds"], "863913619000000000")
+        self.assertEqual(out[0]["utc"], "1997-05-17T23:59:49Z")
+        self.assertEqual(out[0]["taiNanoseconds"], out[1]["taiNanoseconds"])
+        self.assertEqual(out[2]["taiNanoseconds"], "1483228819000000000")
+        self.assertEqual(out[2]["utc"], out[3]["utc"])
+        self.assertEqual(
+            out[2]["taiNanoseconds"], out[3]["taiNanoseconds"]
+        )
+        self.assertIsInstance(out[0]["resolvedGpsWeek"], str)
+
+    def test_modulo_defaults_nanos_to_zero(self) -> None:
+        payload = {"events": [
+            {"id": "m", "gpsWeekModulo": 906, "gpsSecondsInWeek": 18,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+        ]}
+        out = normalize_batch(enc(payload))
+        self.assertEqual(out[0]["utc"], "2017-01-01T00:00:00Z")
+        self.assertEqual(out[0]["resolvedGpsWeek"], "1930")
+
+    def _expect_error(self, payload: object) -> RequestError:
+        with self.assertRaises(RequestError) as cm:
+            normalize_batch(enc(payload))
+        return cm.exception
+
+    def test_field_mixing_rejected(self) -> None:
+        cases = [
+            # utc mixed with modulo fields
+            {"id": "x", "utc": "2017-01-01T00:00:00Z",
+             "gpsWeekModulo": 906, "gpsSecondsInWeek": 0,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+            # utc mixed with a bare referenceUtc
+            {"id": "x", "utc": "2017-01-01T00:00:00Z",
+             "referenceUtc": "2016-01-01T00:00:00Z"},
+            # full week mixed with modulo week
+            {"id": "x", "gpsWeek": 1930, "gpsWeekModulo": 906,
+             "gpsSecondsInWeek": 0,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+            # full week mixed with referenceUtc
+            {"id": "x", "gpsWeek": 1930, "gpsSecondsInWeek": 0,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+            # referenceUtc without gpsWeekModulo
+            {"id": "x", "gpsSecondsInWeek": 0,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+        ]
+        for event in cases:
+            with self.subTest(event=event):
+                exc = self._expect_error({"events": [event]})
+                self.assertEqual(exc.code, "INVALID_EVENT")
+                self.assertEqual(exc.event_id, "x")
+
+    def test_modulo_missing_fields(self) -> None:
+        exc = self._expect_error({"events": [
+            {"id": "m1", "gpsWeekModulo": 906, "gpsSecondsInWeek": 0},
+        ]})
+        self.assertIn("referenceUtc", exc.message)
+        exc = self._expect_error({"events": [
+            {"id": "m2", "gpsWeekModulo": 906,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+        ]})
+        self.assertIn("gpsSecondsInWeek", exc.message)
+
+    def test_modulo_type_and_range_errors_locate_event(self) -> None:
+        exc = self._expect_error({"events": [
+            {"id": "ok", "utc": "2016-12-31T23:59:59Z"},
+            {"id": "bad", "gpsWeekModulo": "906", "gpsSecondsInWeek": 0,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+        ]})
+        self.assertEqual(exc.event_index, 1)
+        self.assertEqual(exc.event_id, "bad")
+        self.assertIn("gpsWeekModulo", exc.message)
+
+        exc = self._expect_error({"events": [
+            {"id": "bad-range", "gpsWeekModulo": 1024,
+             "gpsSecondsInWeek": 0,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+        ]})
+        self.assertEqual(exc.event_id, "bad-range")
+        self.assertIn("[0, 1023]", exc.message)
+
+    def test_modulo_unresolvable_batches_fail_wholesale(self) -> None:
+        # No candidate inside the era within 512 weeks of the reference.
+        exc = self._expect_error({"events": [
+            {"id": "ok", "gpsWeek": 1930, "gpsSecondsInWeek": 18},
+            {"id": "no-cand", "gpsWeekModulo": 1000,
+             "gpsSecondsInWeek": 0,
+             "referenceUtc": "2017-01-01T00:00:00Z"},
+        ]})
+        self.assertEqual(exc.event_index, 1)
+        self.assertEqual(exc.event_id, "no-cand")
+        self.assertIn("no GPS week congruent to 1000", exc.message)
+        self.assertFalse(hasattr(exc, "results"))
+
+        # Exactly at the 512-week rollover midpoint.
+        exc = self._expect_error({"events": [
+            {"id": "midpoint", "gpsWeekModulo": 906,
+             "gpsSecondsInWeek": 0,
+             "referenceUtc": "2007-03-10T23:59:46Z"},
+        ]})
+        self.assertEqual(exc.event_id, "midpoint")
+        self.assertIn("exactly 512 weeks", exc.message)
+
+        # Reference instant outside the supported era.
+        exc = self._expect_error({"events": [
+            {"id": "ref-out", "gpsWeekModulo": 1, "gpsSecondsInWeek": 0,
+             "referenceUtc": "2020-01-01T00:00:00Z"},
+        ]})
+        self.assertEqual(exc.event_id, "ref-out")
+        self.assertIn("2017-06-28", exc.message)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

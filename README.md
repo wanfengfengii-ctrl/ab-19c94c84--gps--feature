@@ -25,7 +25,8 @@ HOST_PORT=9090 docker compose up \
   2. 镜像构建检查（全部源码字节编译、入口点导入、Dockerfile/compose
      静态校验；若挂载了 Docker CLI 与 socket 还会执行
      `docker build --check`）；
-  3. 跨 2016-12-31 闰秒的真实 HTTP 冒烟测试；
+  3. 真实 HTTP 冒烟测试：跨 2016-12-31 闰秒，以及同一 10 位周号在
+     两个 1024 周纪元（1997 与 2016/2017）的解析与歧义拒绝；
 
   最后以退出码报告结论并自行退出（0 全部通过，1 有失败阶段）。
 
@@ -70,6 +71,35 @@ curl -s localhost:8080/healthz
 - GPS 恒定领先 TAI 19 s，闰秒只影响换算出的 UTC 标签。
 - `gpsNanoseconds` 省略时按 0 处理。
 
+### 模周 GPS 事件（10 位周号）
+
+早期接收机只保存 10 位 GPS 周号（每 1024 周 ≈ 19.6 年重复一次）。
+提交 `gpsWeekModulo` 与采集时刻提示 `referenceUtc`，服务在闰秒表
+支持年代内解析出唯一的完整 GPS 周：
+
+```json
+{
+  "events": [
+    {"id": "tm-3", "gpsWeekModulo": 906, "gpsSecondsInWeek": 17,
+     "gpsNanoseconds": 500000000, "referenceUtc": "2017-01-01T00:00:00Z"}
+  ]
+}
+```
+
+- `gpsWeekModulo ∈ [0, 1023]`；`gpsSecondsInWeek`、`gpsNanoseconds`
+  与完整 GPS 事件同义，`referenceUtc` 采用与 `utc` 相同的格式
+  （同样要求在支持年代内）；
+- 解析规则：在支持年代内枚举同余（mod 1024）的完整周，唯一胜者须
+  距参考时刻**严格小于 512 周**；距离按精确 TAI 纳秒整数比较，
+  不经过浮点；
+- 成功结果保留原有响应字段，并额外回显 `"resolvedGpsWeek"`
+  （十进制字符串，仅模周事件携带；完整 GPS 周与 UTC 事件的请求、
+  响应与顺序完全不变）；
+- 下列情形整批失败：年代内无同余周距参考时刻严格小于 512 周
+  （无候选）、候选周恰距参考时刻 512 周（1024 周纪元中点，歧义）、
+  模周字段与 `utc`/`gpsWeek` 混用或缺 `referenceUtc`、参考时刻或
+  解析结果超出支持年代。
+
 ### 响应
 
 ```json
@@ -89,15 +119,18 @@ curl -s localhost:8080/healthz
   （自 1970-01-01T00:00:00 TAI 起的整数纳秒，可为任何大整数）；
 - `utc`：规范 UTC 表示（闰秒渲染为 `23:59:60`，小数尾随零被裁掉）；
 - `utcTaiOffsetSeconds`：该时刻 UTC−TAI 偏移（闰秒进行中仍为旧值，
-  例如 2016-12-31T23:59:60 为 `-36`，2017-01-01T00:00:00 起为 `-37`）。
+  例如 2016-12-31T23:59:60 为 `-36`，2017-01-01T00:00:00 起为 `-37`）；
+- `resolvedGpsWeek`：**仅模周事件**回显，解析出的完整 GPS 周号
+  （十进制字符串）。
 
 **同一物理时刻**无论用 UTC 还是 GPS 提交，三项结果完全一致，
 包括逐字节相同的十进制 TAI 字符串。
 
 ### 错误（整批失败，绝不返回部分结果）
 
-非法日期、越界周内秒、非真实闰秒位置、超出支持年代、重复编号、
-批大小越界、浮点 JSON 数字等都会让**整批请求**失败：
+非法日期、越界周内秒、非真实闰秒位置、超出支持年代、模周无候选或
+恰处 512 周歧义中点、输入种类字段混用、重复编号、批大小越界、
+浮点 JSON 数字等都会让**整批请求**失败：
 
 ```json
 {
@@ -126,10 +159,10 @@ curl -s localhost:8080/healthz
 ## 目录
 
 ```
-app/timecore.py        # 闰秒表 + GPS/UTC/TAI 整数换算
+app/timecore.py        # 闰秒表 + GPS/UTC/TAI 整数换算 + 模周解析
 app/server.py          # POST /api/times/normalize、/healthz
-tests/                 # unittest 用例（40 个）
+tests/                 # unittest 用例（56 个）
 verify/entrypoint.py   # 一次性 verify 编排
-verify/smoke_http.py   # 跨闰秒 HTTP 冒烟
+verify/smoke_http.py   # 跨闰秒 + 跨 1024 周纪元 HTTP 冒烟
 Dockerfile, docker-compose.yml
 ```

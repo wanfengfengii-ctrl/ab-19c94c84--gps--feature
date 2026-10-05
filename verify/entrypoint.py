@@ -8,7 +8,8 @@ the overall verdict and the container then exits):
   3. Image build check: compile every shipped source file and validate
      the Dockerfile / compose wiring; if a Docker CLI and socket are
      available, also run ``docker build --check`` on the context.
-  4. Cross-leap-second HTTP smoke test against the live API.
+  4. HTTP smoke test against the live API, spanning the 2016-12-31
+     leap second and the 10-bit GPS week (mod-1024) era resolution.
 """
 
 from __future__ import annotations
@@ -151,7 +152,7 @@ def image_build_check() -> bool:
 
 
 def run_smoke() -> bool:
-    stage("cross-leap-second HTTP smoke test")
+    stage("HTTP smoke test (leap second + GPS week-era resolution)")
     proc = subprocess.run(
         [sys.executable, str(SRV / "verify" / "smoke_http.py")],
         cwd=SRV, env={**os.environ, "API_HOST": API_HOST, "PORT": PORT},

@@ -45,6 +45,16 @@ GPS_EPOCH_LABEL_NS = 315_964_800 * NS_PER_SECOND
 GPS_TAI_OFFSET_NS = 19 * NS_PER_SECOND
 GPS_EPOCH_TAI_NS = GPS_EPOCH_LABEL_NS + GPS_TAI_OFFSET_NS
 
+# 10-bit GPS week rollover: receivers that keep only the low 10 bits
+# repeat the same week number every 1024 weeks (~19.6 years).
+GPS_WEEK_ROLLOVER = 1024
+GPS_WEEK_MODULO_MAX = GPS_WEEK_ROLLOVER - 1
+WEEK_NS = SECONDS_PER_WEEK * NS_PER_SECOND
+# Half the rollover period.  A candidate full week must be strictly
+# closer than this to the reference instant; exactly this far is the
+# ambiguous midpoint between two 1024-week eras.
+HALF_ROLLOVER_NS = (GPS_WEEK_ROLLOVER // 2) * WEEK_NS
+
 MIN_YEAR = 1972
 
 # leap-seconds.list "#@" expiry line of tzdata 2016g (IERS Bulletin C 52):
@@ -419,6 +429,37 @@ def _strict_int(value: object, field: str) -> int:
     return value
 
 
+def _check_sow_nanos(s: int, ns: int) -> None:
+    if not 0 <= s < SECONDS_PER_WEEK:
+        raise TimeConversionError(
+            f"gpsSecondsInWeek out of range: {s} is not in [0, 604799]"
+        )
+    if not 0 <= ns < NS_PER_SECOND:
+        raise TimeConversionError(
+            f"gpsNanoseconds out of range: {ns} is not in [0, 999999999]"
+        )
+
+
+def _gps_tai_ns(w: int, s: int, ns: int) -> int:
+    return (
+        GPS_EPOCH_LABEL_NS
+        + w * WEEK_NS
+        + s * NS_PER_SECOND
+        + ns
+        + GPS_TAI_OFFSET_NS
+    )
+
+
+def _gps_event_from_tai(tai_ns: int) -> NormalizedEvent:
+    _check_supported_era(tai_ns)
+    ry, rm, rd, rh, rmi, rs, rns, utc_minus_tai = tai_to_utc(tai_ns)
+    return NormalizedEvent(
+        tai_ns=tai_ns,
+        utc_canonical=_format_utc(ry, rm, rd, rh, rmi, rs, rns),
+        utc_minus_tai=utc_minus_tai,
+    )
+
+
 def normalize_gps_event(
     week: object, sow: object, nanos: object = 0,
 ) -> NormalizedEvent:
@@ -430,25 +471,91 @@ def normalize_gps_event(
             f"gpsWeek out of range: {w} is negative (GPS epoch is week 0,"
             " 1980-01-06)"
         )
-    if not 0 <= s < SECONDS_PER_WEEK:
+    _check_sow_nanos(s, ns)
+    return _gps_event_from_tai(_gps_tai_ns(w, s, ns))
+
+
+def normalize_gps_modulo_event(
+    week_modulo: object,
+    sow: object,
+    nanos: object,
+    reference_utc: object,
+) -> tuple[NormalizedEvent, int]:
+    """Resolve a 10-bit (mod-1024) GPS week against a reference instant.
+
+    Returns the normalized event plus the resolved full GPS week.  The
+    winning candidate is the unique full week that is congruent to
+    ``week_modulo`` (mod 1024), lands inside the supported era and lies
+    strictly less than 512 weeks (exact TAI nanoseconds, integer
+    arithmetic only) from ``reference_utc``.  Anything else -- no
+    candidate, or a candidate exactly 512 weeks away (the rollover
+    midpoint) -- is an error.
+    """
+    wm = _strict_int(week_modulo, "gpsWeekModulo")
+    s = _strict_int(sow, "gpsSecondsInWeek")
+    ns = _strict_int(nanos, "gpsNanoseconds")
+    if not 0 <= wm <= GPS_WEEK_MODULO_MAX:
         raise TimeConversionError(
-            f"gpsSecondsInWeek out of range: {s} is not in [0, 604799]"
+            f"gpsWeekModulo out of range: {wm} is not in"
+            f" [0, {GPS_WEEK_MODULO_MAX}]"
         )
-    if not 0 <= ns < NS_PER_SECOND:
+    _check_sow_nanos(s, ns)
+    # The reference instant uses the same validation as a UTC event,
+    # including the supported-era check.
+    try:
+        ref_tai = normalize_utc_event(reference_utc).tai_ns
+    except TimeConversionError as exc:
+        raise TimeConversionError(f"referenceUtc: {exc}") from None
+
+    # Full weeks congruent to wm (mod 1024) whose instant is still
+    # covered by the leap-second table.  The GPS epoch is 1980, so the
+    # lower era bound can never be violated by a non-negative week.
+    in_era: list[tuple[int, int]] = []
+    w = wm
+    while True:
+        tai = _gps_tai_ns(w, s, ns)
+        if tai >= TABLE_EXPIRY_TAI_NS:
+            break
+        in_era.append((w, tai))
+        w += GPS_WEEK_ROLLOVER
+    next_out_of_era = w
+
+    matches: list[int] = []
+    boundary: list[int] = []
+    for cand_week, cand_tai in in_era:
+        dist = cand_tai - ref_tai
+        if dist < 0:
+            dist = -dist
+        if dist < HALF_ROLLOVER_NS:
+            matches.append(cand_week)
+        elif dist == HALF_ROLLOVER_NS:
+            boundary.append(cand_week)
+
+    if len(matches) == 1:
+        resolved = matches[0]
+        return (
+            _gps_event_from_tai(_gps_tai_ns(resolved, s, ns)),
+            resolved,
+        )
+    if boundary:
+        weeks = ", ".join(str(b) for b in boundary)
         raise TimeConversionError(
-            f"gpsNanoseconds out of range: {ns} is not in [0, 999999999]"
+            f"cannot resolve gpsWeekModulo {wm}: GPS week(s) {weeks} lie"
+            " exactly 512 weeks from referenceUtc (the 1024-week rollover"
+            " midpoint), so the full week is ambiguous"
         )
-    tai_ns = (
-        GPS_EPOCH_LABEL_NS
-        + w * SECONDS_PER_WEEK * NS_PER_SECOND
-        + s * NS_PER_SECOND
-        + ns
-        + GPS_TAI_OFFSET_NS
-    )
-    _check_supported_era(tai_ns)
-    ry, rm, rd, rh, rmi, rs, rns, utc_minus_tai = tai_to_utc(tai_ns)
-    return NormalizedEvent(
-        tai_ns=tai_ns,
-        utc_canonical=_format_utc(ry, rm, rd, rh, rmi, rs, rns),
-        utc_minus_tai=utc_minus_tai,
+    if not matches:
+        weeks = ", ".join(str(cw) for cw, _ in in_era)
+        raise TimeConversionError(
+            f"cannot resolve gpsWeekModulo {wm}: no GPS week congruent to"
+            f" {wm} (mod 1024) within the supported era is strictly"
+            " within 512 weeks of referenceUtc (in-era candidate"
+            f" week(s): {weeks}; the next congruent week"
+            f" {next_out_of_era} falls outside the supported era, which"
+            " ends at the table expiry 2017-06-28T00:00:00Z)"
+        )
+    # Unreachable: two distinct mod-1024 weeks differ by >= 1024 weeks,
+    # so both cannot be strictly within 512 weeks of one reference.
+    raise TimeConversionError(  # pragma: no cover
+        f"internal: gpsWeekModulo {wm} resolved to multiple weeks"
     )
