@@ -204,5 +204,150 @@ class BatchErrorTests(unittest.TestCase):
         self.assertEqual(exc.event_id, "1")
 
 
+class GpsModuloBatchTests(unittest.TestCase):
+    MOD_EVENT = {
+        "id": "tape-1", "gpsWeekModulo": 906,
+        "gpsSecondsInWeek": 17, "gpsNanoseconds": 500_000_000,
+        "referenceUtc": "2017-01-02T00:00:00Z",
+    }
+
+    def _expect_error(self, payload: object) -> RequestError:
+        with self.assertRaises(RequestError) as cm:
+            normalize_batch(enc(payload))
+        return cm.exception
+
+    def test_modulo_happy_path_echoes_resolved_week(self) -> None:
+        out = normalize_batch(enc({"events": [dict(self.MOD_EVENT)]}))
+        self.assertEqual(len(out), 1)
+        r = out[0]
+        self.assertEqual(r["id"], "tape-1")
+        self.assertEqual(r["resolvedGpsWeek"], 1930)
+        self.assertEqual(r["taiNanoseconds"], "1483228836500000000")
+        self.assertEqual(r["utc"], "2016-12-31T23:59:60.5Z")
+        self.assertEqual(r["utcTaiOffsetSeconds"], "-36")
+        self.assertEqual(
+            set(r),
+            {"id", "resolvedGpsWeek", "taiNanoseconds", "utc",
+             "utcTaiOffsetSeconds"},
+        )
+
+    def test_modulo_other_epoch_same_modulo(self) -> None:
+        ev = dict(self.MOD_EVENT, referenceUtc="1997-05-20T00:00:00Z")
+        out = normalize_batch(enc({"events": [ev]}))
+        self.assertEqual(out[0]["resolvedGpsWeek"], 906)
+        self.assertEqual(out[0]["utc"], "1997-05-18T00:00:06.5Z")
+        self.assertEqual(out[0]["utcTaiOffsetSeconds"], "-30")
+
+    def test_nanoseconds_optional_and_order_preserved(self) -> None:
+        payload = {"events": [
+            {"id": "utc-a", "utc": "2016-12-31T23:59:60Z"},
+            {"id": "mod-b", "gpsWeekModulo": 906,
+             "gpsSecondsInWeek": 0, "referenceUtc": "1997-06-01T00:00:00Z"},
+            {"id": "full-c", "gpsWeek": 1930, "gpsSecondsInWeek": 18},
+        ]}
+        out = normalize_batch(enc(payload))
+        self.assertEqual([r["id"] for r in out], ["utc-a", "mod-b", "full-c"])
+        self.assertEqual(out[1]["resolvedGpsWeek"], 906)
+        self.assertNotIn("resolvedGpsWeek", out[0])
+        self.assertNotIn("resolvedGpsWeek", out[2])
+
+    def test_modulo_equivalent_to_full_week_and_utc(self) -> None:
+        payload = {"events": [
+            dict(self.MOD_EVENT, id="via-mod"),
+            {"id": "via-full", "gpsWeek": 1930,
+             "gpsSecondsInWeek": 17, "gpsNanoseconds": 500_000_000},
+            {"id": "via-utc", "utc": "2016-12-31T23:59:60.5Z"},
+        ]}
+        out = normalize_batch(enc(payload))
+        self.assertEqual(
+            out[0]["taiNanoseconds"], out[1]["taiNanoseconds"]
+        )
+        self.assertEqual(
+            out[0]["taiNanoseconds"], out[2]["taiNanoseconds"]
+        )
+        self.assertEqual(out[0]["utc"], out[2]["utc"])
+
+    def test_field_mixing_rejected(self) -> None:
+        bad_events = [
+            dict(self.MOD_EVENT, id="m1", utc="2016-12-31T23:59:59Z"),
+            dict(self.MOD_EVENT, id="m2", gpsWeek=1930),
+            {"id": "m3", "gpsWeek": 1930, "gpsWeekModulo": 906,
+             "gpsSecondsInWeek": 1, "referenceUtc": "2010-01-01T00:00:00Z"},
+            {"id": "m4", "utc": "2016-12-31T23:59:59Z",
+             "referenceUtc": "2010-01-01T00:00:00Z"},
+        ]
+        for ev in bad_events:
+            with self.subTest(ev=ev["id"]):
+                exc = self._expect_error({"events": [ev]})
+                self.assertEqual(exc.code, "INVALID_EVENT")
+                self.assertEqual(exc.event_index, 0)
+                self.assertEqual(exc.event_id, ev["id"])
+
+    def test_missing_modulo_fields(self) -> None:
+        bases = {
+            "no-mod": {"id": "e", "gpsSecondsInWeek": 17,
+                       "referenceUtc": "2017-01-02T00:00:00Z"},
+            "no-sow": {"id": "e", "gpsWeekModulo": 906,
+                       "referenceUtc": "2017-01-02T00:00:00Z"},
+            "no-ref": {"id": "e", "gpsWeekModulo": 906,
+                       "gpsSecondsInWeek": 17},
+        }
+        for label, ev in bases.items():
+            with self.subTest(label=label):
+                exc = self._expect_error({"events": [ev]})
+                self.assertEqual(exc.event_id, "e")
+                self.assertEqual(exc.event_index, 0)
+
+    def test_modulo_out_of_range_indexed(self) -> None:
+        ev = dict(self.MOD_EVENT, id="bad-mod", gpsWeekModulo=1024)
+        exc = self._expect_error({"events": [
+            {"id": "ok", "utc": "2016-12-31T23:59:59Z"}, ev,
+        ]})
+        self.assertEqual(exc.event_index, 1)
+        self.assertEqual(exc.event_id, "bad-mod")
+        self.assertIn("gpsWeekModulo", exc.message)
+
+    def test_no_candidate_indexed_no_partial_results(self) -> None:
+        ev = dict(self.MOD_EVENT, id="no-cand",
+                  gpsWeekModulo=931, gpsSecondsInWeek=259_218,
+                  gpsNanoseconds=0, referenceUtc="2017-06-26T00:00:00Z")
+        exc = self._expect_error({"events": [
+            {"id": "ok-1", "utc": "2016-12-31T23:59:59Z"}, ev,
+            {"id": "ok-3", "utc": "2017-01-01T00:00:00Z"},
+        ]})
+        self.assertEqual(exc.event_index, 1)
+        self.assertEqual(exc.event_id, "no-cand")
+        self.assertIn("no GPS week congruent", exc.message)
+        self.assertFalse(hasattr(exc, "results"))
+
+    def test_exact_boundary_indexed(self) -> None:
+        ev = {
+            "id": "edge", "gpsWeekModulo": 906,
+            "gpsSecondsInWeek": 100, "gpsNanoseconds": 200,
+            "referenceUtc": "2007-03-11T00:01:26.0000002Z",
+        }
+        exc = self._expect_error({"events": [ev]})
+        self.assertEqual(exc.event_index, 0)
+        self.assertEqual(exc.event_id, "edge")
+        self.assertIn("512-week", exc.message)
+
+    def test_modulo_integer_literal_enforced(self) -> None:
+        for field, value in (
+            ("gpsWeekModulo", "906"),
+            ("gpsSecondsInWeek", "17"),
+        ):
+            with self.subTest(field=field):
+                ev = dict(self.MOD_EVENT, **{field: value})
+                exc = self._expect_error({"events": [ev]})
+                self.assertEqual(exc.event_id, "tape-1")
+                self.assertIn(field, exc.message)
+
+    def test_reference_utc_must_be_string(self) -> None:
+        ev = dict(self.MOD_EVENT, referenceUtc=2017)
+        exc = self._expect_error({"events": [ev]})
+        self.assertEqual(exc.event_id, "tape-1")
+        self.assertIn("referenceUtc", exc.message)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -37,6 +37,14 @@ NS_PER_SECOND = 1_000_000_000
 SECONDS_PER_DAY = 86_400
 SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY
 NS_PER_DAY = SECONDS_PER_DAY * NS_PER_SECOND
+NS_PER_WEEK = SECONDS_PER_WEEK * NS_PER_SECOND
+
+# 10-bit GPS week rollover period.
+GPS_WEEK_MODULUS = 1024
+NS_PER_WEEK_MODULUS = GPS_WEEK_MODULUS * NS_PER_WEEK
+# A modulo week resolves to the unique full week whose event instant is
+# *strictly* less than this many nanoseconds (512 weeks) from the reference.
+HALF_WEEK_MODULUS_NS = NS_PER_WEEK_MODULUS // 2
 
 # 1980-01-06T00:00:00 UTC as a raw UTC label (seconds since 1970-01-01,
 # ignoring leap seconds -- the well-known GPS POSIX epoch constant).
@@ -200,13 +208,20 @@ class NormalizedEvent:
     tai_ns: int
     utc_canonical: str
     utc_minus_tai: int  # e.g. -37 means TAI-UTC = 37 s
+    # Full GPS week for GPS-style inputs (None for UTC events).  For a
+    # gpsWeekModulo event this is the unique week resolved against the
+    # reference within the strict 512-week window.
+    resolved_gps_week: int | None = None
 
     def to_response(self) -> dict[str, object]:
-        return {
+        body = {
             "taiNanoseconds": str(self.tai_ns),
             "utc": self.utc_canonical,
             "utcTaiOffsetSeconds": str(self.utc_minus_tai),
         }
+        if self.resolved_gps_week is not None:
+            body["resolvedGpsWeek"] = self.resolved_gps_week
+        return body
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +455,7 @@ def normalize_gps_event(
         )
     tai_ns = (
         GPS_EPOCH_LABEL_NS
-        + w * SECONDS_PER_WEEK * NS_PER_SECOND
+        + w * NS_PER_WEEK
         + s * NS_PER_SECOND
         + ns
         + GPS_TAI_OFFSET_NS
@@ -451,4 +466,103 @@ def normalize_gps_event(
         tai_ns=tai_ns,
         utc_canonical=_format_utc(ry, rm, rd, rh, rmi, rs, rns),
         utc_minus_tai=utc_minus_tai,
+    )
+
+
+def resolve_gps_modulo_event(
+    week_modulo: object, sow: object, nanos: object, reference_utc: object,
+) -> NormalizedEvent:
+    """Resolve a 10-bit (modulo 1024) GPS week against a UTC reference.
+
+    Exactly one full week ``W`` with ``W ≡ gpsWeekModulo (mod 1024)`` may
+    exist whose event instant is inside the supported era and whose exact
+    TAI distance to the reference instant is strictly less than 512 weeks;
+    that week is the answer.  Distance and congruence are compared in
+    integer TAI nanoseconds -- never via floating point.  No candidate
+    (all congruent instants are outside the supported era) and two
+    candidates (the reference sits on the exact 512-week ambiguity
+    boundary) both fail.
+    """
+    mod = _strict_int(week_modulo, "gpsWeekModulo")
+    s = _strict_int(sow, "gpsSecondsInWeek")
+    ns = _strict_int(nanos, "gpsNanoseconds")
+    if not 0 <= mod < GPS_WEEK_MODULUS:
+        raise TimeConversionError(
+            f"gpsWeekModulo out of range: {mod} is not in [0, 1023]"
+        )
+    if not 0 <= s < SECONDS_PER_WEEK:
+        raise TimeConversionError(
+            f"gpsSecondsInWeek out of range: {s} is not in [0, 604799]"
+        )
+    if not 0 <= ns < NS_PER_SECOND:
+        raise TimeConversionError(
+            f"gpsNanoseconds out of range: {ns} is not in [0, 999999999]"
+        )
+    reference = normalize_utc_event(reference_utc)
+    ref_ns = reference.tai_ns
+
+    # Congruent full weeks are spaced exactly 1024 weeks.  Anchor at the
+    # unique congruent week whose start is at/after the GPS epoch; every
+    # other candidate is that week plus an integer multiple of 1024.
+    # Candidates are enumerated with integer index arithmetic only.
+    within_week_ns = s * NS_PER_SECOND + ns
+    anchor_tai_ns = GPS_EPOCH_TAI_NS + mod * NS_PER_WEEK + within_week_ns
+
+    # Candidate index k (any integer): TAI = anchor + k * 1024 weeks.
+    # Python divmod floors, so rem lies in [0, modulus); candidate k0 is
+    # rem ns before the reference and candidate k0+1 is (modulus - rem)
+    # ns after it.  Those are the only two congruent instants that can
+    # fall within 1024 weeks of the reference, so the enumeration is
+    # finite and provably complete.
+    delta_ns = ref_ns - anchor_tai_ns
+    k0, rem = divmod(delta_ns, NS_PER_WEEK_MODULUS)
+    candidates = (
+        (mod + k0 * GPS_WEEK_MODULUS,
+         anchor_tai_ns + k0 * NS_PER_WEEK_MODULUS, rem),
+        (mod + (k0 + 1) * GPS_WEEK_MODULUS,
+         anchor_tai_ns + (k0 + 1) * NS_PER_WEEK_MODULUS,
+         NS_PER_WEEK_MODULUS - rem),
+    )
+
+    near: list[tuple[int, int]] = []       # distance strictly < 512 weeks
+    on_boundary: list[tuple[int, int]] = []  # distance exactly 512 weeks
+    for week, tai_ns, distance in candidates:
+        if tai_ns < MIN_SUPPORTED_TAI_NS or tai_ns >= TABLE_EXPIRY_TAI_NS:
+            continue
+        if distance < HALF_WEEK_MODULUS_NS:
+            near.append((week, tai_ns))
+        elif distance == HALF_WEEK_MODULUS_NS:
+            on_boundary.append((week, tai_ns))
+
+    # Two strict interior candidates are mathematically impossible (the
+    # open window is exactly one modulus wide); guard regardless.
+    if len(near) > 1:
+        weeks = ", ".join(str(w) for w, _ in sorted(near))
+        raise TimeConversionError(
+            f"gpsWeekModulo {mod} is ambiguous within 512 weeks of"
+            f" reference {reference.utc_canonical}: weeks {weeks}"
+        )
+    if not near:
+        if on_boundary:
+            weeks = ", ".join(str(w) for w, _ in sorted(on_boundary))
+            raise TimeConversionError(
+                f"gpsWeekModulo {mod} sits on the exact 512-week ambiguity"
+                f" boundary near reference {reference.utc_canonical}"
+                f" (week(s) {weeks} are exactly 512 weeks away); the"
+                " distance must be strictly less than 512 weeks"
+            )
+        raise TimeConversionError(
+            f"no GPS week congruent to {mod} modulo 1024 exists within the"
+            " supported era [1972-01-01T00:00:00Z, 2017-06-28T00:00:00Z)"
+            " and strictly less than 512 weeks from the reference instant"
+            f" {reference.utc_canonical}"
+        )
+
+    week, tai_ns = near[0]
+    ry, rm, rd, rh, rmi, rs, rns, utc_minus_tai = tai_to_utc(tai_ns)
+    return NormalizedEvent(
+        tai_ns=tai_ns,
+        utc_canonical=_format_utc(ry, rm, rd, rh, rmi, rs, rns),
+        utc_minus_tai=utc_minus_tai,
+        resolved_gps_week=week,
     )

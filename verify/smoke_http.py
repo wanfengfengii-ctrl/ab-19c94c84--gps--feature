@@ -134,6 +134,147 @@ def main() -> int:
         "GPS week 0 SOW 0 maps to 1980-01-06T00:00:00Z (TAI -19 s)",
     )
 
+    print("[smoke] 10-bit modulo GPS week resolved across 1024-week epochs")
+    # Weeks 906 (1997) and 1930 (2016) share modulo 906; at SOW 17 with
+    # 500 ms they are exactly one rollover epoch (1024 weeks) apart.
+    mod_base = {
+        "gpsWeekModulo": 906,
+        "gpsSecondsInWeek": 17,
+        "gpsNanoseconds": 500_000_000,
+    }
+    status, body = post({"events": [
+        {**mod_base, "id": "old-epoch",
+         "referenceUtc": "1997-05-20T00:00:00Z"},
+        {**mod_base, "id": "new-epoch",
+         "referenceUtc": "2017-01-02T00:00:00Z"},
+    ]})
+    check(status == 200, f"modulo batch status 200 (got {status})")
+    if status != 200:
+        print(json.dumps(body, indent=2))
+        return 1
+    old_r, new_r = (by_id(body["results"], k) for k in
+                    ("old-epoch", "new-epoch"))
+    check(
+        old_r["resolvedGpsWeek"] == 906
+        and new_r["resolvedGpsWeek"] == 1930,
+        "same modulo 906 resolves to week 906 (1997) or 1930 (2016)"
+        " by reference epoch",
+    )
+    check(
+        [r["id"] for r in body["results"]] == ["old-epoch", "new-epoch"],
+        "modulo batch keeps request order",
+    )
+    check(
+        old_r["utc"] == "1997-05-18T00:00:06.5Z"
+        and old_r["utcTaiOffsetSeconds"] == "-30"
+        and old_r["taiNanoseconds"] == "863913636500000000",
+        "old-epoch modulo event normalized on the 1997 TAI axis",
+    )
+    check(
+        new_r["utc"] == "2016-12-31T23:59:60.5Z"
+        and new_r["utcTaiOffsetSeconds"] == "-36"
+        and new_r["taiNanoseconds"] == "1483228836500000000",
+        "new-epoch modulo event lands on the 2016 leap second",
+    )
+    check(
+        "resolvedGpsWeek" not in pre_u,
+        "plain full-week/UTC events keep their original response fields",
+    )
+
+    # A reference exactly at the event instant (distance 0) is fine.
+    status, body = post({"events": [{
+        "id": "zero-dist", **mod_base,
+        "referenceUtc": "2016-12-31T23:59:60.5Z",
+    }]})
+    check(
+        status == 200
+        and body["results"][0]["resolvedGpsWeek"] == 1930,
+        "reference identical to the event instant resolves it",
+    )
+
+    print("[smoke] modulo failure modes fail the whole batch")
+    # (1) exact 512-week ambiguity boundary: the reference is equidistant
+    # (in exact TAI nanoseconds) from weeks 906 and 1930.
+    status, body = post({"events": [{
+        "id": "edge", "gpsWeekModulo": 906, "gpsSecondsInWeek": 100,
+        "gpsNanoseconds": 200,
+        "referenceUtc": "2007-03-11T00:01:26.0000002Z",
+    }]})
+    err = body.get("error", {})
+    check(
+        status == 400 and err.get("eventId") == "edge"
+        and err.get("eventIndex") == 0 and "512-week" in err.get(
+            "message", ""),
+        "reference on the exact 512-week boundary -> 400, located",
+    )
+    check("results" not in body, "boundary error carries no results")
+    # one nanosecond off the boundary resolves
+    status, body = post({"events": [{
+        "id": "edge-off", "gpsWeekModulo": 906, "gpsSecondsInWeek": 100,
+        "gpsNanoseconds": 200,
+        "referenceUtc": "2007-03-11T00:01:26.000000201Z",
+    }]})
+    check(
+        status == 200
+        and body["results"][0]["resolvedGpsWeek"] == 1930,
+        "1 ns past the boundary resolves uniquely to week 1930",
+    )
+
+    # (2) no candidate: congruent instant beyond the table expiry.
+    status, body = post({"events": [
+        {"id": "fine", "utc": "2016-12-31T23:59:59Z"},
+        {"id": "no-cand", "gpsWeekModulo": 931,
+         "gpsSecondsInWeek": 259_218, "gpsNanoseconds": 0,
+         "referenceUtc": "2017-06-26T00:00:00Z"},
+    ]})
+    err = body.get("error", {})
+    check(
+        status == 400 and err.get("eventId") == "no-cand"
+        and err.get("eventIndex") == 1
+        and "no GPS week congruent" in err.get("message", ""),
+        "all congruent candidates out of era -> 400 at the event",
+    )
+
+    # (3) field mixing across the three event kinds.
+    for ev in (
+        {"id": "mix1", "gpsWeekModulo": 906, "gpsWeek": 1930,
+         "gpsSecondsInWeek": 1, "referenceUtc": "2010-01-01T00:00:00Z"},
+        {"id": "mix2", "gpsWeekModulo": 906,
+         "gpsSecondsInWeek": 1, "referenceUtc": "2010-01-01T00:00:00Z",
+         "utc": "2009-01-01T00:00:00Z"},
+    ):
+        status, body = post({"events": [ev]})
+        err = body.get("error", {})
+        check(
+            status == 400 and err.get("eventId") == ev["id"]
+            and "choose exactly one" in err.get("message", ""),
+            f"mixed event kinds ({ev['id']}) -> 400",
+        )
+
+    # (4) modulo value outside [0,1023].
+    status, body = post({"events": [{
+        "id": "bad-mod", "gpsWeekModulo": 1024,
+        "gpsSecondsInWeek": 0, "referenceUtc": "2010-01-01T00:00:00Z",
+    }]})
+    err = body.get("error", {})
+    check(
+        status == 400 and err.get("eventId") == "bad-mod"
+        and "[0, 1023]" in err.get("message", ""),
+        "gpsWeekModulo 1024 -> 400 with legal range",
+    )
+
+    # (5) reference outside the supported era fails the batch.
+    status, body = post({"events": [{
+        "id": "bad-ref", "gpsWeekModulo": 906, "gpsSecondsInWeek": 0,
+        "referenceUtc": "2020-01-01T00:00:00Z",
+    }]})
+    err = body.get("error", {})
+    check(
+        status == 400 and err.get("eventId") == "bad-ref"
+        and "2017-06-28" in err.get("message", ""),
+        "referenceUtc beyond supported era -> 400 naming the expiry",
+    )
+
     print("[smoke] invalid batches fail wholesale with locatable errors")
     status, body = post({"events": [
         {"id": "fine", "utc": "2016-12-31T23:59:59Z"},
